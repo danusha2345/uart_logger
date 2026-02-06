@@ -1,0 +1,67 @@
+[package]
+name = "uart_logger"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Passive UART logger for RP2350A — captures bidirectional UART to SD card"
+
+[dependencies]
+# Embassy async runtime
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-rp = { version = "0.9", features = ["defmt", "time-driver", "critical-section-impl"] }
+embassy-sync = "0.7"
+embassy-futures = "0.1"
+
+# Cortex-M runtime
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+
+# Panic handling
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+# Logging
+defmt = "1.0"
+defmt-rtt = "1.1"
+
+# SD card
+embedded-sdmmc = "0.9"
+embedded-hal = "1.0"
+embedded-hal-bus = "0.3"
+
+# Heapless collections (no_std)
+heapless = "0.9"
+
+# Static cell for shared state
+static_cell = "2"
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+# PIO and WS2812
+pio = "0.3"
+fixed = "1.29"
+fixed-macro = "1.2"
+smart-leds = "0.4"
+
+# Async IO traits
+embedded-io-async = "0.6"
+
+# Direct register access for UART FIFO tuning
+rp-pac = { version = "7", features = ["rp235x"] }
+
+[features]
+default = ["rp2350"]
+rp2350 = ["embassy-rp/rp235xa", "embassy-rp/imagedef-secure-exe"]
+
+[profile.dev]
+debug = 2
+opt-level = 1
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "z"
+codegen-units = 1
+
+[[bin]]
+name = "uart_logger"
+path = "src/main.rs"
