@@ -29,9 +29,6 @@ embedded-sdmmc = "0.9"
 embedded-hal = "1.0"
 embedded-hal-bus = "0.3"
 
-# Heapless collections (no_std)
-heapless = "0.9"
-
 # Static cell for shared state
 static_cell = "2"
 portable-atomic = { version = "1", features = ["critical-section"] }
@@ -59,7 +56,7 @@ opt-level = 1
 [profile.release]
 debug = 2
 lto = true
-opt-level = "z"
+opt-level = "s"
 codegen-units = 1
 
 [[bin]]

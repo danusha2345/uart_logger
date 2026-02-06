@@ -13,7 +13,7 @@ mod sd_writer;
 use config::*;
 use led::{Color, Ws2812};
 use sd_writer::{
-    CortexMDelay, DummyTimeSource, SdWriteBuffer, encode_record, find_next_log_number,
+    CortexMDelay, DummyTimeSource, SdWriteBuffer, find_next_log_number,
     format_log_filename,
 };
 
@@ -24,6 +24,7 @@ use embassy_rp::peripherals::{PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
 use embassy_rp::spi;
 use embassy_rp::uart::{BufferedUart, BufferedUartRx, Config as UartConfig};
+use embassy_rp::watchdog::Watchdog;
 use embassy_rp::bind_interrupts;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -77,6 +78,11 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     info!("UART Logger starting...");
+
+    // ── Watchdog (5 sec timeout) ────────────────────────────────────────
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
+    watchdog.start(Duration::from_secs(5));
+    info!("Watchdog started (5s timeout)");
 
     // ── LED (PIO0, SM0, DMA_CH0, GPIO16) ────────────────────────────────
     let Pio {
@@ -147,7 +153,7 @@ async fn main(spawner: Spawner) {
     // ── Spawn tasks ─────────────────────────────────────────────────────
     spawner.must_spawn(uart_rx_task(uart0_rx, DIR_LINE_A, "A"));
     spawner.must_spawn(uart_rx_task(uart1_rx, DIR_LINE_B, "B"));
-    spawner.must_spawn(sd_writer_task(spi1, cs));
+    spawner.must_spawn(sd_writer_task(spi1, cs, watchdog));
 
     info!("All tasks spawned");
 }
@@ -203,10 +209,53 @@ async fn uart_rx_task(
 
 type SdSpi = spi::Spi<'static, embassy_rp::peripherals::SPI1, spi::Blocking>;
 type SdCs = Output<'static>;
+type SdSpiDev = ExclusiveDevice<SdSpi, SdCs, CortexMDelay>;
+type SdVolumeManager = VolumeManager<SdCard<SdSpiDev, CortexMDelay>, DummyTimeSource>;
 
+/// Flush write buffer to SD card. Returns Ok(bytes_written) or Err on failure.
+fn flush_buf_to_sd(
+    volume_mgr: &SdVolumeManager,
+    file: embedded_sdmmc::RawFile,
+    write_buf: &mut SdWriteBuffer,
+) -> Result<usize, ()>
+{
+    if !write_buf.has_data() {
+        return Ok(0);
+    }
+    let n = write_buf.as_slice().len();
+    if let Err(e) = volume_mgr.write(file, write_buf.as_slice()) {
+        error!("SD write error: {:?}", defmt::Debug2Format(&e));
+        return Err(());
+    }
+    write_buf.clear();
+    Ok(n)
+}
+
+/// Encode a packet into write_buf, flushing to SD if needed.
+/// Returns false on SD write error.
+fn encode_and_maybe_flush(
+    volume_mgr: &SdVolumeManager,
+    file: embedded_sdmmc::RawFile,
+    write_buf: &mut SdWriteBuffer,
+    bytes_written: &mut u32,
+    direction: u8,
+    timestamp_ms: u32,
+    data: &[u8],
+) -> bool {
+    let n = write_buf.encode_into(direction, timestamp_ms, data);
+    if n == 0 {
+        // Buffer full — flush first, then encode
+        match flush_buf_to_sd(volume_mgr, file, write_buf) {
+            Ok(written) => *bytes_written = bytes_written.saturating_add(written as u32),
+            Err(()) => return false,
+        }
+        write_buf.encode_into(direction, timestamp_ms, data);
+    }
+    true
+}
 
 #[embassy_executor::task]
-async fn sd_writer_task(spi: SdSpi, cs: SdCs) {
+async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
     info!("sd_writer_task started");
 
     // Create SPI device wrapper for embedded-sdmmc
@@ -216,6 +265,7 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs) {
             error!("Failed to create SPI device");
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
             loop {
+                watchdog.feed();
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
@@ -223,9 +273,10 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs) {
 
     let sd_card = SdCard::new(spi_device, CortexMDelay);
 
-    // Try to initialize SD card
+    // SD init with retries
     let mut init_ok = false;
     for attempt in 1..=SD_INIT_RETRIES {
+        watchdog.feed();
         info!("SD init attempt {}/{}...", attempt, SD_INIT_RETRIES);
         match sd_card.num_bytes() {
             Ok(bytes) => {
@@ -244,12 +295,20 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs) {
     if !init_ok {
         error!("SD card init failed after {} attempts", SD_INIT_RETRIES);
         SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
+        // Watchdog will reboot us
         loop {
+            watchdog.feed();
             Timer::after(Duration::from_secs(1)).await;
         }
     }
 
-    // Open volume manager, find next log number, open file (Raw API)
+    // P0: Switch SPI to working frequency (16 MHz) after SD init
+    sd_card.spi(|dev| {
+        dev.bus_mut().set_frequency(SD_SPI_WORK_FREQ);
+    });
+    info!("SPI switched to {} Hz", SD_SPI_WORK_FREQ);
+
+    // Open volume manager (owns sd_card for the rest of the program lifetime)
     let volume_mgr = VolumeManager::new(sd_card, DummyTimeSource);
 
     let raw_volume = match volume_mgr.open_raw_volume(VolumeIdx(0)) {
@@ -257,9 +316,7 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs) {
         Err(e) => {
             error!("Failed to open volume: {:?}", defmt::Debug2Format(&e));
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            loop {
-                Timer::after(Duration::from_secs(1)).await;
-            }
+            loop { watchdog.feed(); Timer::after(Duration::from_secs(1)).await; }
         }
     };
 
@@ -268,93 +325,133 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs) {
         Err(e) => {
             error!("Failed to open root dir: {:?}", defmt::Debug2Format(&e));
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            loop {
-                Timer::after(Duration::from_secs(1)).await;
-            }
+            loop { watchdog.feed(); Timer::after(Duration::from_secs(1)).await; }
         }
     };
 
-    let log_num = find_next_log_number(&volume_mgr, root_dir);
-    let filename_bytes = format_log_filename(log_num);
-    let filename = core::str::from_utf8(&filename_bytes).unwrap_or("LOG_0001.BIN");
-    info!("Opening log file: {}", filename);
+    let mut log_num = find_next_log_number(&volume_mgr, root_dir);
 
-    let file = match volume_mgr.open_file_in_dir(root_dir, filename, Mode::ReadWriteCreateOrTruncate) {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Failed to create log file: {:?}", defmt::Debug2Format(&e));
-            SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            loop {
-                Timer::after(Duration::from_secs(1)).await;
-            }
-        }
-    };
-
-    info!("Recording to {}", filename);
-    SYSTEM_STATE.store(STATE_RECORDING, Ordering::Relaxed);
-
-    // Main write loop
-    let mut write_buf = SdWriteBuffer::new();
-    let mut encode_buf = [0u8; 7 + MAX_PACKET_DATA]; // max record size
-    let mut last_flush = Instant::now();
-
+    // ── Main loop: open file → write → rotate/recover ───────────────────
     loop {
-        // Wait for packet or timeout
-        match embassy_futures::select::select(
-            UART_LOG_CHANNEL.receive(),
-            Timer::after(Duration::from_millis(SD_FLUSH_TIMEOUT_MS)),
-        )
-        .await
-        {
-            embassy_futures::select::Either::First(packet) => {
-                let n = encode_record(
-                    &mut encode_buf,
-                    packet.direction,
-                    packet.timestamp_ms,
-                    &packet.data[..packet.len as usize],
-                );
+        watchdog.feed();
 
-                if n > 0 {
-                    let needs_flush = write_buf.append(&encode_buf[..n]);
+        let filename_bytes = format_log_filename(log_num);
+        let filename = core::str::from_utf8(&filename_bytes).unwrap_or("LOG_0001.BIN");
+        info!("Opening log file: {}", filename);
 
-                    if needs_flush {
-                        if let Err(e) = volume_mgr.write(file, write_buf.as_slice()) {
-                            error!("SD write error: {:?}", defmt::Debug2Format(&e));
-                            SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-                        }
-                        write_buf.clear();
-                        last_flush = Instant::now();
+        let file = match volume_mgr.open_file_in_dir(root_dir, filename, Mode::ReadWriteCreateOrTruncate) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to create log file: {:?}", defmt::Debug2Format(&e));
+                SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
+                // Try next file number
+                log_num += 1;
+                Timer::after(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        info!("Recording to {}", filename);
+        SYSTEM_STATE.store(STATE_RECORDING, Ordering::Relaxed);
+
+        // ── Write loop for current file ─────────────────────────────────
+        let mut write_buf = SdWriteBuffer::new();
+        let mut last_sync = Instant::now();
+        let mut bytes_written: u32 = 0;
+        let mut sd_error = false;
+
+        'write_loop: loop {
+            watchdog.feed();
+
+            // Wait for packet or timeout
+            let packet = match embassy_futures::select::select(
+                UART_LOG_CHANNEL.receive(),
+                Timer::after(Duration::from_millis(SD_FLUSH_TIMEOUT_MS)),
+            )
+            .await
+            {
+                embassy_futures::select::Either::First(pkt) => Some(pkt),
+                embassy_futures::select::Either::Second(_timeout) => None,
+            };
+
+            if let Some(pkt) = packet {
+                // Encode directly into write buffer
+                if !encode_and_maybe_flush(
+                    &volume_mgr, file, &mut write_buf, &mut bytes_written,
+                    pkt.direction, pkt.timestamp_ms, &pkt.data[..pkt.len as usize],
+                ) {
+                    sd_error = true;
+                    break 'write_loop;
+                }
+
+                // Batch receive: drain all pending packets
+                while let Ok(batch_pkt) = UART_LOG_CHANNEL.try_receive() {
+                    if !encode_and_maybe_flush(
+                        &volume_mgr, file, &mut write_buf, &mut bytes_written,
+                        batch_pkt.direction, batch_pkt.timestamp_ms,
+                        &batch_pkt.data[..batch_pkt.len as usize],
+                    ) {
+                        sd_error = true;
+                        break 'write_loop;
                     }
                 }
-            }
-            embassy_futures::select::Either::Second(_timeout) => {
+
+                // Flush if buffer is >75% full
+                if write_buf.remaining() < SD_WRITE_BUF_SIZE / 4 {
+                    match flush_buf_to_sd(&volume_mgr, file, &mut write_buf) {
+                        Ok(written) => bytes_written = bytes_written.saturating_add(written as u32),
+                        Err(()) => { sd_error = true; break 'write_loop; }
+                    }
+                }
+            } else {
                 // Timeout — flush if there's data
                 if write_buf.has_data() {
-                    if let Err(e) = volume_mgr.write(file, write_buf.as_slice()) {
-                        error!("SD flush error: {:?}", defmt::Debug2Format(&e));
-                        SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-                    } else if let Err(e) = volume_mgr.flush_file(file) {
+                    match flush_buf_to_sd(&volume_mgr, file, &mut write_buf) {
+                        Ok(written) => bytes_written = bytes_written.saturating_add(written as u32),
+                        Err(()) => { sd_error = true; break 'write_loop; }
+                    }
+                    // Sync file metadata on idle
+                    if let Err(e) = volume_mgr.flush_file(file) {
                         error!("SD sync error: {:?}", defmt::Debug2Format(&e));
                     }
-                    write_buf.clear();
-                    last_flush = Instant::now();
+                    last_sync = Instant::now();
                 }
+            }
+
+            // Periodic sync during active writing (every SD_SYNC_INTERVAL_MS)
+            if last_sync.elapsed() > Duration::from_millis(SD_SYNC_INTERVAL_MS) {
+                if write_buf.has_data() {
+                    match flush_buf_to_sd(&volume_mgr, file, &mut write_buf) {
+                        Ok(written) => bytes_written = bytes_written.saturating_add(written as u32),
+                        Err(()) => { sd_error = true; break 'write_loop; }
+                    }
+                }
+                if let Err(e) = volume_mgr.flush_file(file) {
+                    error!("SD sync error: {:?}", defmt::Debug2Format(&e));
+                }
+                last_sync = Instant::now();
+            }
+
+            // File rotation by size
+            if bytes_written >= MAX_LOG_FILE_SIZE {
+                info!("Log file reached {} bytes, rotating...", bytes_written);
+                break 'write_loop;
             }
         }
 
-        // Periodic flush even during active writing
-        if write_buf.has_data()
-            && last_flush.elapsed() > Duration::from_millis(SD_FLUSH_TIMEOUT_MS)
-        {
-            if let Err(e) = volume_mgr.write(file, write_buf.as_slice()) {
-                error!("SD periodic flush error: {:?}", defmt::Debug2Format(&e));
-                SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            } else if let Err(e) = volume_mgr.flush_file(file) {
-                error!("SD sync error: {:?}", defmt::Debug2Format(&e));
-            }
-            write_buf.clear();
-            last_flush = Instant::now();
+        // ── Cleanup current file ────────────────────────────────────────
+        let _ = flush_buf_to_sd(&volume_mgr, file, &mut write_buf);
+        let _ = volume_mgr.flush_file(file);
+        let _ = volume_mgr.close_file(file);
+
+        if sd_error {
+            warn!("SD error, will retry with new file...");
+            SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
+            Timer::after(Duration::from_secs(2)).await;
         }
+
+        log_num += 1;
+        // Continue outer loop: open next file
     }
 }
 

@@ -15,24 +15,7 @@ impl TimeSource for DummyTimeSource {
     }
 }
 
-/// Encode a binary log record: [dir:1][timestamp_ms:4 LE][length:2 LE][data...]
-/// Returns number of bytes written to `out`
-pub fn encode_record(out: &mut [u8], direction: u8, timestamp_ms: u32, data: &[u8]) -> usize {
-    let len = data.len().min(MAX_PACKET_DATA);
-    let total = 1 + 4 + 2 + len; // header + data
-    if out.len() < total {
-        return 0;
-    }
-
-    out[0] = direction;
-    out[1..5].copy_from_slice(&timestamp_ms.to_le_bytes());
-    out[5..7].copy_from_slice(&(len as u16).to_le_bytes());
-    out[7..7 + len].copy_from_slice(&data[..len]);
-
-    total
-}
-
-/// 4KB write buffer with flush-on-full semantics
+/// Write buffer with flush-on-full semantics
 pub struct SdWriteBuffer {
     buf: [u8; SD_WRITE_BUF_SIZE],
     pos: usize,
@@ -46,13 +29,27 @@ impl SdWriteBuffer {
         }
     }
 
-    /// Append data to the buffer. Returns true if buffer became full and needs flush.
-    pub fn append(&mut self, data: &[u8]) -> bool {
-        let remaining = SD_WRITE_BUF_SIZE - self.pos;
-        let to_copy = data.len().min(remaining);
-        self.buf[self.pos..self.pos + to_copy].copy_from_slice(&data[..to_copy]);
-        self.pos += to_copy;
-        self.pos >= SD_WRITE_BUF_SIZE
+    /// Returns number of free bytes in buffer
+    pub fn remaining(&self) -> usize {
+        SD_WRITE_BUF_SIZE - self.pos
+    }
+
+    /// Encode a binary log record directly into the buffer.
+    /// Returns number of bytes encoded, or 0 if not enough space.
+    /// If 0 is returned, caller should flush and retry.
+    pub fn encode_into(&mut self, direction: u8, timestamp_ms: u32, data: &[u8]) -> usize {
+        let len = data.len().min(MAX_PACKET_DATA);
+        let total = 1 + 4 + 2 + len; // dir + ts + length + data
+        if self.remaining() < total {
+            return 0;
+        }
+        let p = self.pos;
+        self.buf[p] = direction;
+        self.buf[p + 1..p + 5].copy_from_slice(&timestamp_ms.to_le_bytes());
+        self.buf[p + 5..p + 7].copy_from_slice(&(len as u16).to_le_bytes());
+        self.buf[p + 7..p + 7 + len].copy_from_slice(&data[..len]);
+        self.pos += total;
+        total
     }
 
     /// Get buffered data as slice
@@ -116,13 +113,18 @@ fn parse_4digit_ascii(digits: &[u8]) -> Option<u16> {
     Some(result)
 }
 
-/// Format log filename: "LOG_0001.BIN" etc.
+/// Format log filename: "LOG_0001.BIN" etc. Wraps around at 9999.
 pub fn format_log_filename(num: u16) -> [u8; 12] {
     let mut name = *b"LOG_0000.BIN";
-    let d0 = (num / 1000) % 10;
-    let d1 = (num / 100) % 10;
-    let d2 = (num / 10) % 10;
-    let d3 = num % 10;
+    // Wrap around: 0→1, 10000→1, etc.
+    let n = match num % 10000 {
+        0 => 1,
+        v => v,
+    };
+    let d0 = (n / 1000) % 10;
+    let d1 = (n / 100) % 10;
+    let d2 = (n / 10) % 10;
+    let d3 = n % 10;
     name[4] = b'0' + d0 as u8;
     name[5] = b'0' + d1 as u8;
     name[6] = b'0' + d2 as u8;
