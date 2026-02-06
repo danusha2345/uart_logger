@@ -84,11 +84,11 @@ async fn main(spawner: Spawner) {
     watchdog.start(Duration::from_secs(5));
     info!("Watchdog started (5s timeout)");
 
-    // ── LED (PIO0, SM0, DMA_CH0, GPIO16) ────────────────────────────────
+    // ── LED (PIO0, SM0, DMA_CH0, GPIO25) ────────────────────────────────
     let Pio {
         mut common, sm0, ..
     } = Pio::new(p.PIO0, Irqs);
-    let ws2812 = Ws2812::new(&mut common, sm0, p.DMA_CH0, p.PIN_16);
+    let ws2812 = Ws2812::new(&mut common, sm0, p.DMA_CH0, p.PIN_25);
     spawner.must_spawn(led_task(ws2812));
 
     // ── SD card SPI1 (blocking) ─────────────────────────────────────────
