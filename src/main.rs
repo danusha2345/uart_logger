@@ -13,19 +13,18 @@ mod sd_writer;
 use config::*;
 use led::{Color, Ws2812};
 use sd_writer::{
-    CortexMDelay, DummyTimeSource, SdWriteBuffer, find_next_log_number,
-    format_log_filename,
+    find_next_log_number, format_log_filename, CortexMDelay, DummyTimeSource, SdWriteBuffer,
 };
 
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
 use embassy_rp::spi;
 use embassy_rp::uart::{BufferedUart, BufferedUartRx, Config as UartConfig};
 use embassy_rp::watchdog::Watchdog;
-use embassy_rp::bind_interrupts;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
@@ -76,65 +75,61 @@ static PACKETS_DROPPED: AtomicU32 = AtomicU32::new(0);
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-
     info!("UART Logger starting...");
 
-    // ── Watchdog (5 sec timeout) ────────────────────────────────────────
-    let mut watchdog = Watchdog::new(p.WATCHDOG);
-    watchdog.start(Duration::from_secs(5));
-    info!("Watchdog started (5s timeout)");
-
-    // ── LED (PIO0, SM0, DMA_CH0, GPIO25) ────────────────────────────────
+    // ── LED init (blue = STATE_INIT) ─────────────────────────────────────
     let Pio {
         mut common, sm0, ..
     } = Pio::new(p.PIO0, Irqs);
     let ws2812 = Ws2812::new(&mut common, sm0, p.DMA_CH0, p.PIN_25);
     spawner.must_spawn(led_task(ws2812));
+    Timer::after(Duration::from_millis(500)).await;
 
-    // ── SD card SPI1 (blocking) ─────────────────────────────────────────
+    // ── Watchdog → RED ──────────────────────────────────────────────────
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
+    watchdog.start(Duration::from_secs(5));
+    SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed); // RED
+    Timer::after(Duration::from_millis(500)).await;
+
+    // ── SPI → YELLOW ────────────────────────────────────────────────────
     let mut spi_config = spi::Config::default();
     spi_config.frequency = SD_SPI_INIT_FREQ;
-
     let spi1 = spi::Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi_config);
     let cs = Output::new(p.PIN_13, Level::High);
+    SYSTEM_STATE.store(STATE_OVERFLOW, Ordering::Relaxed); // YELLOW
+    Timer::after(Duration::from_millis(500)).await;
 
-    // ── UART0 (Line A: TX=GPIO0, RX=GPIO1) ─────────────────────────────
+    // ── UART0 → GREEN ───────────────────────────────────────────────────
     static TX_BUF0: StaticCell<[u8; 32]> = StaticCell::new();
     static RX_BUF0: StaticCell<[u8; UART_RX_BUF_SIZE]> = StaticCell::new();
     let tx_buf0 = &mut TX_BUF0.init([0; 32])[..];
     let rx_buf0 = &mut RX_BUF0.init([0; UART_RX_BUF_SIZE])[..];
-
     let mut uart0_config = UartConfig::default();
     uart0_config.baudrate = UART_BAUDRATE;
     let uart0 = BufferedUart::new(
         p.UART0,
-        p.PIN_0, // TX (unused but required by HAL)
-        p.PIN_1, // RX — Line A input
+        p.PIN_0,
+        p.PIN_1,
         Irqs,
         tx_buf0,
         rx_buf0,
         uart0_config,
     );
     let (_uart0_tx, uart0_rx) = uart0.split();
+    SYSTEM_STATE.store(STATE_RECORDING, Ordering::Relaxed); // GREEN
+    Timer::after(Duration::from_millis(500)).await;
 
-    // Reduce FIFO threshold: 1/4 full (4 bytes) for faster interrupt response
-    rp_pac::UART0.uartifls().write(|w| {
-        w.set_rxiflsel(0b001);
-        w.set_txiflsel(0b000);
-    });
-
-    // ── UART1 (Line B: TX=GPIO4, RX=GPIO5) ─────────────────────────────
+    // ── UART1 ──────────────────────────────────────────────────────────
     static TX_BUF1: StaticCell<[u8; 32]> = StaticCell::new();
     static RX_BUF1: StaticCell<[u8; UART_RX_BUF_SIZE]> = StaticCell::new();
     let tx_buf1 = &mut TX_BUF1.init([0; 32])[..];
     let rx_buf1 = &mut RX_BUF1.init([0; UART_RX_BUF_SIZE])[..];
-
     let mut uart1_config = UartConfig::default();
     uart1_config.baudrate = UART_BAUDRATE;
     let uart1 = BufferedUart::new(
         p.UART1,
-        p.PIN_4, // TX (unused but required by HAL)
-        p.PIN_5, // RX — Line B input
+        p.PIN_4,
+        p.PIN_5,
         Irqs,
         tx_buf1,
         rx_buf1,
@@ -142,20 +137,15 @@ async fn main(spawner: Spawner) {
     );
     let (_uart1_tx, uart1_rx) = uart1.split();
 
-    // Reduce FIFO threshold for UART1 too
-    rp_pac::UART1.uartifls().write(|w| {
-        w.set_rxiflsel(0b001);
-        w.set_txiflsel(0b000);
-    });
-
-    info!("UART FIFO thresholds set to 1/4 (4 bytes)");
-
     // ── Spawn tasks ─────────────────────────────────────────────────────
     spawner.must_spawn(uart_rx_task(uart0_rx, DIR_LINE_A, "A"));
     spawner.must_spawn(uart_rx_task(uart1_rx, DIR_LINE_B, "B"));
     spawner.must_spawn(sd_writer_task(spi1, cs, watchdog));
 
     info!("All tasks spawned");
+    loop {
+        Timer::after(Duration::from_secs(60)).await;
+    }
 }
 
 // ============================================================================
@@ -163,11 +153,7 @@ async fn main(spawner: Spawner) {
 // ============================================================================
 
 #[embassy_executor::task(pool_size = 2)]
-async fn uart_rx_task(
-    mut rx: BufferedUartRx,
-    direction: u8,
-    name: &'static str,
-) {
+async fn uart_rx_task(mut rx: BufferedUartRx, direction: u8, name: &'static str) {
     info!("uart_rx_task({}) started", name);
 
     let mut buf = [0u8; MAX_PACKET_DATA];
@@ -217,8 +203,7 @@ fn flush_buf_to_sd(
     volume_mgr: &SdVolumeManager,
     file: embedded_sdmmc::RawFile,
     write_buf: &mut SdWriteBuffer,
-) -> Result<usize, ()>
-{
+) -> Result<usize, ()> {
     if !write_buf.has_data() {
         return Ok(0);
     }
@@ -316,7 +301,10 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
         Err(e) => {
             error!("Failed to open volume: {:?}", defmt::Debug2Format(&e));
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            loop { watchdog.feed(); Timer::after(Duration::from_secs(1)).await; }
+            loop {
+                watchdog.feed();
+                Timer::after(Duration::from_secs(1)).await;
+            }
         }
     };
 
@@ -325,9 +313,71 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
         Err(e) => {
             error!("Failed to open root dir: {:?}", defmt::Debug2Format(&e));
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            loop { watchdog.feed(); Timer::after(Duration::from_secs(1)).await; }
+            loop {
+                watchdog.feed();
+                Timer::after(Duration::from_secs(1)).await;
+            }
         }
     };
+
+    // ── SD card write/read/verify test ──────────────────────────────────
+    SYSTEM_STATE.store(STATE_SD_TEST, Ordering::Relaxed);
+    info!("SD card test: write/read/verify...");
+    {
+        let test_ok = (|| -> Result<(), &'static str> {
+            // Write test pattern (512 bytes: 0x00..0xFF, 0x00..0xFF)
+            let test_file = volume_mgr
+                .open_file_in_dir(root_dir, "TEST.BIN", Mode::ReadWriteCreateOrTruncate)
+                .map_err(|_| "create test file")?;
+            let mut pattern = [0u8; 512];
+            for (i, b) in pattern.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            volume_mgr
+                .write(test_file, &pattern)
+                .map_err(|_| "write test data")?;
+            volume_mgr
+                .close_file(test_file)
+                .map_err(|_| "close after write")?;
+
+            // Read back and verify
+            let test_file = volume_mgr
+                .open_file_in_dir(root_dir, "TEST.BIN", Mode::ReadOnly)
+                .map_err(|_| "open test file for read")?;
+            let mut readback = [0u8; 512];
+            let bytes_read = volume_mgr
+                .read(test_file, &mut readback)
+                .map_err(|_| "read test data")?;
+            volume_mgr
+                .close_file(test_file)
+                .map_err(|_| "close after read")?;
+
+            if bytes_read != 512 {
+                return Err("wrong read length");
+            }
+            if readback != pattern {
+                return Err("data mismatch");
+            }
+
+            // Cleanup: delete test file
+            let _ = volume_mgr.delete_file_in_dir(root_dir, "TEST.BIN");
+
+            Ok(())
+        })();
+
+        match test_ok {
+            Ok(()) => info!("SD card test PASSED"),
+            Err(step) => {
+                error!("SD card test FAILED at: {}", step);
+                SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
+                loop {
+                    watchdog.feed();
+                    Timer::after(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    info!("SD test passed, starting recording");
 
     let mut log_num = find_next_log_number(&volume_mgr, root_dir);
 
@@ -339,7 +389,11 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
         let filename = core::str::from_utf8(&filename_bytes).unwrap_or("LOG_0001.BIN");
         info!("Opening log file: {}", filename);
 
-        let file = match volume_mgr.open_file_in_dir(root_dir, filename, Mode::ReadWriteCreateOrTruncate) {
+        let file = match volume_mgr.open_file_in_dir(
+            root_dir,
+            filename,
+            Mode::ReadWriteCreateOrTruncate,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 error!("Failed to create log file: {:?}", defmt::Debug2Format(&e));
@@ -377,8 +431,13 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
             if let Some(pkt) = packet {
                 // Encode directly into write buffer
                 if !encode_and_maybe_flush(
-                    &volume_mgr, file, &mut write_buf, &mut bytes_written,
-                    pkt.direction, pkt.timestamp_ms, &pkt.data[..pkt.len as usize],
+                    &volume_mgr,
+                    file,
+                    &mut write_buf,
+                    &mut bytes_written,
+                    pkt.direction,
+                    pkt.timestamp_ms,
+                    &pkt.data[..pkt.len as usize],
                 ) {
                     sd_error = true;
                     break 'write_loop;
@@ -387,8 +446,12 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                 // Batch receive: drain all pending packets
                 while let Ok(batch_pkt) = UART_LOG_CHANNEL.try_receive() {
                     if !encode_and_maybe_flush(
-                        &volume_mgr, file, &mut write_buf, &mut bytes_written,
-                        batch_pkt.direction, batch_pkt.timestamp_ms,
+                        &volume_mgr,
+                        file,
+                        &mut write_buf,
+                        &mut bytes_written,
+                        batch_pkt.direction,
+                        batch_pkt.timestamp_ms,
                         &batch_pkt.data[..batch_pkt.len as usize],
                     ) {
                         sd_error = true;
@@ -400,7 +463,10 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                 if write_buf.remaining() < SD_WRITE_BUF_SIZE / 4 {
                     match flush_buf_to_sd(&volume_mgr, file, &mut write_buf) {
                         Ok(written) => bytes_written = bytes_written.saturating_add(written as u32),
-                        Err(()) => { sd_error = true; break 'write_loop; }
+                        Err(()) => {
+                            sd_error = true;
+                            break 'write_loop;
+                        }
                     }
                 }
             } else {
@@ -408,11 +474,26 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                 if write_buf.has_data() {
                     match flush_buf_to_sd(&volume_mgr, file, &mut write_buf) {
                         Ok(written) => bytes_written = bytes_written.saturating_add(written as u32),
-                        Err(()) => { sd_error = true; break 'write_loop; }
+                        Err(()) => {
+                            sd_error = true;
+                            break 'write_loop;
+                        }
                     }
-                    // Sync file metadata on idle
+                    last_sync = Instant::now();
+                }
+
+                // SD heartbeat: every 2s write a probe byte + flush to detect card removal
+                // (flush_file alone is a no-op if nothing is dirty)
+                if last_sync.elapsed() > Duration::from_secs(2) {
+                    if let Err(e) = volume_mgr.write(file, &[0xFE]) {
+                        error!("SD heartbeat write failed: {:?}", defmt::Debug2Format(&e));
+                        sd_error = true;
+                        break 'write_loop;
+                    }
                     if let Err(e) = volume_mgr.flush_file(file) {
-                        error!("SD sync error: {:?}", defmt::Debug2Format(&e));
+                        error!("SD heartbeat flush failed: {:?}", defmt::Debug2Format(&e));
+                        sd_error = true;
+                        break 'write_loop;
                     }
                     last_sync = Instant::now();
                 }
@@ -423,7 +504,10 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                 if write_buf.has_data() {
                     match flush_buf_to_sd(&volume_mgr, file, &mut write_buf) {
                         Ok(written) => bytes_written = bytes_written.saturating_add(written as u32),
-                        Err(()) => { sd_error = true; break 'write_loop; }
+                        Err(()) => {
+                            sd_error = true;
+                            break 'write_loop;
+                        }
                     }
                 }
                 if let Err(e) = volume_mgr.flush_file(file) {
@@ -488,15 +572,17 @@ async fn led_task(mut ws2812: Ws2812<'static, PIO0, 0>) {
             }
             STATE_OVERFLOW => {
                 // Yellow blink
-                let color = if tick {
-                    Color::yellow()
-                } else {
-                    Color::off()
-                };
+                let color = if tick { Color::yellow() } else { Color::off() };
                 ws2812.write_color(color).await;
                 Timer::after(Duration::from_millis(250)).await;
                 // Return to recording after showing overflow
                 SYSTEM_STATE.store(STATE_RECORDING, Ordering::Relaxed);
+            }
+            STATE_SD_TEST => {
+                // Magenta pulse — SD test in progress
+                let color = if tick { Color::magenta() } else { Color::off() };
+                ws2812.write_color(color).await;
+                Timer::after(Duration::from_millis(200)).await;
             }
             _ => {
                 ws2812.write_color(Color::off()).await;

@@ -63,6 +63,3 @@ codegen-units = 1
 name = "uart_logger"
 path = "src/main.rs"
 
-[[bin]]
-name = "led_test"
-path = "src/bin/led_test.rs"

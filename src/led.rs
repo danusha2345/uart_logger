@@ -24,35 +24,23 @@ impl Color {
     }
 
     pub const fn green() -> Self {
-        Self {
-            r: 0,
-            g: 50,
-            b: 0,
-        }
+        Self { r: 0, g: 50, b: 0 }
     }
 
     pub const fn blue() -> Self {
-        Self {
-            r: 0,
-            g: 0,
-            b: 100,
-        }
+        Self { r: 0, g: 0, b: 100 }
     }
 
     pub const fn red() -> Self {
-        Self {
-            r: 100,
-            g: 0,
-            b: 0,
-        }
+        Self { r: 100, g: 0, b: 0 }
     }
 
     pub const fn yellow() -> Self {
-        Self {
-            r: 80,
-            g: 40,
-            b: 0,
-        }
+        Self { r: 80, g: 40, b: 0 }
+    }
+
+    pub const fn magenta() -> Self {
+        Self { r: 80, g: 0, b: 80 }
     }
 
     /// Convert to smart_leds RGB8

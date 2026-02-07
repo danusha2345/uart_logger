@@ -39,3 +39,4 @@ pub const STATE_INIT: u8 = 0;
 pub const STATE_SD_ERROR: u8 = 1;
 pub const STATE_RECORDING: u8 = 2;
 pub const STATE_OVERFLOW: u8 = 3;
+pub const STATE_SD_TEST: u8 = 4;
