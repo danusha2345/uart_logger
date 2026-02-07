@@ -7,8 +7,9 @@ pub const UART_BAUDRATE: u32 = 921_600;
 pub const DIR_LINE_A: u8 = 0x00; // UART0 RX (GPIO1)
 pub const DIR_LINE_B: u8 = 0x01; // UART1 RX (GPIO5)
 
-/// Embassy BufferedUart RX buffer size per channel (~44 ms at 921600 baud)
-pub const UART_RX_BUF_SIZE: usize = 4096;
+/// Embassy BufferedUart RX buffer size per channel (~177 ms at 921600 baud)
+/// Large buffer compensates for blocking SPI stalls during SD writes
+pub const UART_RX_BUF_SIZE: usize = 16384;
 
 /// Max data payload per log record
 pub const MAX_PACKET_DATA: usize = 256;
@@ -33,6 +34,9 @@ pub const MAX_LOG_FILE_SIZE: u32 = 100 * 1024 * 1024;
 
 /// Flush file metadata to SD every N seconds during active writing
 pub const SD_SYNC_INTERVAL_MS: u64 = 5_000;
+
+/// SD heartbeat interval (ms) — periodic flush to detect card removal during idle
+pub const SD_HEARTBEAT_INTERVAL_MS: u64 = 2_000;
 
 /// System state values for LED indication (AtomicU8)
 pub const STATE_INIT: u8 = 0;

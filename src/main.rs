@@ -234,7 +234,13 @@ fn encode_and_maybe_flush(
             Ok(written) => *bytes_written = bytes_written.saturating_add(written as u32),
             Err(()) => return false,
         }
-        write_buf.encode_into(direction, timestamp_ms, data);
+        if write_buf.encode_into(direction, timestamp_ms, data) == 0 {
+            warn!(
+                "Packet too large for write buffer ({}+7 > {})",
+                data.len(),
+                SD_WRITE_BUF_SIZE
+            );
+        }
     }
     true
 }
@@ -482,14 +488,8 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                     last_sync = Instant::now();
                 }
 
-                // SD heartbeat: every 2s write a probe byte + flush to detect card removal
-                // (flush_file alone is a no-op if nothing is dirty)
-                if last_sync.elapsed() > Duration::from_secs(2) {
-                    if let Err(e) = volume_mgr.write(file, &[0xFE]) {
-                        error!("SD heartbeat write failed: {:?}", defmt::Debug2Format(&e));
-                        sd_error = true;
-                        break 'write_loop;
-                    }
+                // SD heartbeat: periodic flush to detect card removal during idle
+                if last_sync.elapsed() > Duration::from_millis(SD_HEARTBEAT_INTERVAL_MS) {
                     if let Err(e) = volume_mgr.flush_file(file) {
                         error!("SD heartbeat flush failed: {:?}", defmt::Debug2Format(&e));
                         sd_error = true;
@@ -531,7 +531,8 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
         if sd_error {
             warn!("SD error, will retry with new file...");
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            Timer::after(Duration::from_secs(2)).await;
+            // Drain pending packets to prevent channel overflow during recovery
+            while UART_LOG_CHANNEL.try_receive().is_ok() {}
         }
 
         log_num += 1;
