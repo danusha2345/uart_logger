@@ -405,7 +405,7 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                 error!("Failed to create log file: {:?}", defmt::Debug2Format(&e));
                 SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
                 // Try next file number
-                log_num += 1;
+                log_num = log_num.wrapping_add(1);
                 Timer::after(Duration::from_secs(2)).await;
                 continue;
             }
@@ -436,6 +436,7 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
 
             if let Some(pkt) = packet {
                 // Encode directly into write buffer
+                let len = (pkt.len as usize).min(MAX_PACKET_DATA);
                 if !encode_and_maybe_flush(
                     &volume_mgr,
                     file,
@@ -443,7 +444,7 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                     &mut bytes_written,
                     pkt.direction,
                     pkt.timestamp_ms,
-                    &pkt.data[..pkt.len as usize],
+                    &pkt.data[..len],
                 ) {
                     sd_error = true;
                     break 'write_loop;
@@ -451,6 +452,7 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
 
                 // Batch receive: drain all pending packets
                 while let Ok(batch_pkt) = UART_LOG_CHANNEL.try_receive() {
+                    let batch_len = (batch_pkt.len as usize).min(MAX_PACKET_DATA);
                     if !encode_and_maybe_flush(
                         &volume_mgr,
                         file,
@@ -458,11 +460,16 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                         &mut bytes_written,
                         batch_pkt.direction,
                         batch_pkt.timestamp_ms,
-                        &batch_pkt.data[..batch_pkt.len as usize],
+                        &batch_pkt.data[..batch_len],
                     ) {
                         sd_error = true;
                         break 'write_loop;
                     }
+                }
+
+                // Channel drained — clear overflow indication if it was set
+                if SYSTEM_STATE.load(Ordering::Relaxed) == STATE_OVERFLOW {
+                    SYSTEM_STATE.store(STATE_RECORDING, Ordering::Relaxed);
                 }
 
                 // Flush if buffer is >75% full
@@ -512,6 +519,8 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                 }
                 if let Err(e) = volume_mgr.flush_file(file) {
                     error!("SD sync error: {:?}", defmt::Debug2Format(&e));
+                    sd_error = true;
+                    break 'write_loop;
                 }
                 last_sync = Instant::now();
             }
@@ -532,10 +541,17 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
             warn!("SD error, will retry with new file...");
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
             // Drain pending packets to prevent channel overflow during recovery
-            while UART_LOG_CHANNEL.try_receive().is_ok() {}
+            let mut drained: u32 = 0;
+            while UART_LOG_CHANNEL.try_receive().is_ok() {
+                drained += 1;
+            }
+            if drained > 0 {
+                let total = PACKETS_DROPPED.fetch_add(drained, Ordering::Relaxed) + drained;
+                warn!("Drained {} packets during SD recovery (total dropped: {})", drained, total);
+            }
         }
 
-        log_num += 1;
+        log_num = log_num.wrapping_add(1);
         // Continue outer loop: open next file
     }
 }
@@ -572,12 +588,10 @@ async fn led_task(mut ws2812: Ws2812<'static, PIO0, 0>) {
                 Timer::after(Duration::from_millis(500)).await;
             }
             STATE_OVERFLOW => {
-                // Yellow blink
+                // Yellow blink — stays until cleared by sd_writer_task
                 let color = if tick { Color::yellow() } else { Color::off() };
                 ws2812.write_color(color).await;
                 Timer::after(Duration::from_millis(250)).await;
-                // Return to recording after showing overflow
-                SYSTEM_STATE.store(STATE_RECORDING, Ordering::Relaxed);
             }
             STATE_SD_TEST => {
                 // Magenta pulse — SD test in progress

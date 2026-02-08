@@ -22,20 +22,16 @@ impl TimeSource for DummyTimeSource {
         let minutes = ((rem % 3600) / 60) as u8;
         let seconds = (rem % 60) as u8;
 
-        // Approximate: add days to Jan 1, wrapping within 2025
-        let mut month: u8 = 1;
-        let mut day: u8 = 1 + (days % 28) as u8; // Stay within 28 to avoid month overflow
-        if days >= 28 {
-            month = (1 + (days / 28) % 12) as u8;
-            if month > 12 {
-                month = 12;
-            }
-        }
-        if day > 28 {
-            day = 28;
-        }
+        // Approximate: add days to Jan 1, wrapping within year
+        let year = 2025 + (days / 336) as u16;
+        let month = if days >= 28 {
+            (1 + (days / 28) % 12) as u8
+        } else {
+            1
+        };
+        let day = 1 + (days % 28) as u8;
 
-        Timestamp::from_calendar(2025, month, day, hours, minutes, seconds)
+        Timestamp::from_calendar(year, month, day, hours, minutes, seconds)
             .unwrap_or(Timestamp::from_calendar(2025, 1, 1, 0, 0, 0).unwrap())
     }
 }
