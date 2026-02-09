@@ -85,21 +85,17 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(led_task(ws2812));
     Timer::after(Duration::from_millis(500)).await;
 
-    // ── Watchdog → RED ──────────────────────────────────────────────────
+    // ── Watchdog ──────────────────────────────────────────────────────
     let mut watchdog = Watchdog::new(p.WATCHDOG);
     watchdog.start(Duration::from_secs(5));
-    SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed); // RED
-    Timer::after(Duration::from_millis(500)).await;
 
-    // ── SPI → YELLOW ────────────────────────────────────────────────────
+    // ── SPI ────────────────────────────────────────────────────────────
     let mut spi_config = spi::Config::default();
     spi_config.frequency = SD_SPI_INIT_FREQ;
     let spi1 = spi::Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi_config);
     let cs = Output::new(p.PIN_13, Level::High);
-    SYSTEM_STATE.store(STATE_OVERFLOW, Ordering::Relaxed); // YELLOW
-    Timer::after(Duration::from_millis(500)).await;
 
-    // ── UART0 → GREEN ───────────────────────────────────────────────────
+    // ── UART0 ───────────────────────────────────────────────────────────
     static TX_BUF0: StaticCell<[u8; 32]> = StaticCell::new();
     static RX_BUF0: StaticCell<[u8; UART_RX_BUF_SIZE]> = StaticCell::new();
     let tx_buf0 = &mut TX_BUF0.init([0; 32])[..];
@@ -116,8 +112,6 @@ async fn main(spawner: Spawner) {
         uart0_config,
     );
     let (_uart0_tx, uart0_rx) = uart0.split();
-    SYSTEM_STATE.store(STATE_RECORDING, Ordering::Relaxed); // GREEN
-    Timer::after(Duration::from_millis(500)).await;
 
     // ── UART1 ──────────────────────────────────────────────────────────
     static TX_BUF1: StaticCell<[u8; 32]> = StaticCell::new();
@@ -177,7 +171,13 @@ async fn uart_rx_task(mut rx: BufferedUartRx, direction: u8, name: &'static str)
                     if dropped % 100 == 1 {
                         warn!("Channel full, dropped {} packets (line {})", dropped, name);
                     }
-                    SYSTEM_STATE.store(STATE_OVERFLOW, Ordering::Relaxed);
+                    // Ставим OVERFLOW только если сейчас RECORDING — не затираем SD_ERROR и т.д.
+                    let _ = SYSTEM_STATE.compare_exchange(
+                        STATE_RECORDING,
+                        STATE_OVERFLOW,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                 }
             }
             Ok(_) => {} // 0 bytes, retry
@@ -402,12 +402,12 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
         ) {
             Ok(f) => f,
             Err(e) => {
-                error!("Failed to create log file: {:?}", defmt::Debug2Format(&e));
+                error!("Failed to create log file: {:?} — watchdog reboot in 5s...", defmt::Debug2Format(&e));
                 SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-                // Try next file number
-                log_num = log_num.wrapping_add(1);
-                Timer::after(Duration::from_secs(2)).await;
-                continue;
+                while UART_LOG_CHANNEL.try_receive().is_ok() {}
+                loop {
+                    Timer::after(Duration::from_secs(1)).await;
+                }
             }
         };
 
@@ -497,10 +497,14 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
 
                 // SD heartbeat: periodic flush to detect card removal during idle
                 if last_sync.elapsed() > Duration::from_millis(SD_HEARTBEAT_INTERVAL_MS) {
-                    if let Err(e) = volume_mgr.flush_file(file) {
-                        error!("SD heartbeat flush failed: {:?}", defmt::Debug2Format(&e));
-                        sd_error = true;
-                        break 'write_loop;
+                    if volume_mgr.flush_file(file).is_err() {
+                        warn!("SD heartbeat flush failed, retry in 100ms...");
+                        Timer::after(Duration::from_millis(100)).await;
+                        if let Err(e) = volume_mgr.flush_file(file) {
+                            error!("SD heartbeat flush retry failed: {:?}", defmt::Debug2Format(&e));
+                            sd_error = true;
+                            break 'write_loop;
+                        }
                     }
                     last_sync = Instant::now();
                 }
@@ -517,10 +521,14 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                         }
                     }
                 }
-                if let Err(e) = volume_mgr.flush_file(file) {
-                    error!("SD sync error: {:?}", defmt::Debug2Format(&e));
-                    sd_error = true;
-                    break 'write_loop;
+                if volume_mgr.flush_file(file).is_err() {
+                    warn!("SD sync flush failed, retry in 100ms...");
+                    Timer::after(Duration::from_millis(100)).await;
+                    if let Err(e) = volume_mgr.flush_file(file) {
+                        error!("SD sync retry failed: {:?}", defmt::Debug2Format(&e));
+                        sd_error = true;
+                        break 'write_loop;
+                    }
                 }
                 last_sync = Instant::now();
             }
@@ -538,21 +546,18 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
         let _ = volume_mgr.close_file(file);
 
         if sd_error {
-            warn!("SD error, will retry with new file...");
+            error!("SD fatal error — watchdog reboot in 5s...");
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
-            // Drain pending packets to prevent channel overflow during recovery
-            let mut drained: u32 = 0;
-            while UART_LOG_CHANNEL.try_receive().is_ok() {
-                drained += 1;
-            }
-            if drained > 0 {
-                let total = PACKETS_DROPPED.fetch_add(drained, Ordering::Relaxed) + drained;
-                warn!("Drained {} packets during SD recovery (total dropped: {})", drained, total);
+            // Drain channel to prevent uart_rx_task from blocking
+            while UART_LOG_CHANNEL.try_receive().is_ok() {}
+            // Не кормим watchdog → перезагрузка через ~5 секунд
+            loop {
+                Timer::after(Duration::from_secs(1)).await;
             }
         }
 
         log_num = log_num.wrapping_add(1);
-        // Continue outer loop: open next file
+        // Continue outer loop: open next file (rotation)
     }
 }
 
