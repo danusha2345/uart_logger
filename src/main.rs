@@ -256,7 +256,6 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
             error!("Failed to create SPI device");
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
             loop {
-                watchdog.feed();
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
@@ -288,7 +287,6 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
         SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
         // Watchdog will reboot us
         loop {
-            watchdog.feed();
             Timer::after(Duration::from_secs(1)).await;
         }
     }
@@ -308,7 +306,6 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
             error!("Failed to open volume: {:?}", defmt::Debug2Format(&e));
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
             loop {
-                watchdog.feed();
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
@@ -320,7 +317,6 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
             error!("Failed to open root dir: {:?}", defmt::Debug2Format(&e));
             SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
             loop {
-                watchdog.feed();
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
@@ -377,7 +373,6 @@ async fn sd_writer_task(spi: SdSpi, cs: SdCs, mut watchdog: Watchdog) {
                 error!("SD card test FAILED at: {}", step);
                 SYSTEM_STATE.store(STATE_SD_ERROR, Ordering::Relaxed);
                 loop {
-                    watchdog.feed();
                     Timer::after(Duration::from_secs(1)).await;
                 }
             }
