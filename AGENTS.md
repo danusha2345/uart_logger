@@ -1,19 +1,19 @@
-## Project Map
+## Карта проекта
 
-- Purpose: passive RP2350 UART logger that records two UART directions to SD card.
-- Entry point: `src/main.rs`.
-- Key modules: `src/config.rs`, `src/sd_writer.rs`, `src/led.rs`.
-- Build helpers/artifacts: `build.rs`, `build_uf2.sh`, `uart_logger*.uf2`.
-- Hardware and file-format docs: `README.md`.
+- Назначение: пассивный UART-логгер на RP2350, пишет два направления UART на SD-карту.
+- Точка входа: `src/main.rs`.
+- Ключевые модули: `src/config.rs`, `src/sd_writer.rs`, `src/led.rs`.
+- Сборочные хелперы/артефакты: `build.rs`, `build_uf2.sh`, `uart_logger*.uf2`.
+- Документация по железу и формату файлов: `README.md`.
 
-## Build And Test
+## Сборка и тесты
 
-- Check/build: `cargo build --release`.
-- Flash via runner: `cargo run --release`.
-- UF2 helper: `./build_uf2.sh`.
+- Проверка/сборка: `cargo build --release`.
+- Прошивка через runner: `cargo run --release`.
+- UF2-хелпер: `./build_uf2.sh`.
 
-## Local Pitfalls
+## Локальные подводные камни
 
-- Logger is RX-only and must be wired in parallel; do not add TX behavior casually.
-- Firmware supports FAT32/FAT16 SD cards, not exFAT.
-- Do not commit generated `target/` output or fresh UF2 artifacts unless explicitly requested.
+- Логгер только RX и подключается параллельно; не добавлять TX-поведение без необходимости.
+- Прошивка поддерживает SD-карты FAT32/FAT16, exFAT не поддерживается.
+- Не коммитить генерированный `target/` или свежие UF2-артефакты, если явно не попросили.

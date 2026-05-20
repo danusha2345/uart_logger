@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Этот файл — инструкции для Claude Code при работе с репозиторием.
 
-## Project Overview
+## Обзор проекта
 
-Passive bidirectional UART traffic logger on **Spotpear RP2350-Core-A** (ARM Cortex-M85). Captures two UART lines at 921600 baud and writes to SD card in binary format. The device is listen-only (RX), never transmits. Written in embedded Rust (no_std) with Embassy async runtime.
+Пассивный двунаправленный логгер UART-трафика на **Spotpear RP2350-Core-A** (ARM Cortex-M85). Захватывает две UART-линии на 921600 baud и пишет на SD-карту в бинарном формате. Устройство только слушает (RX), никогда не передаёт. Написано на embedded Rust (no_std) с асинхронным рантаймом Embassy.
 
-## Build & Flash Commands
+## Команды сборки и прошивки
 
 ```bash
 cargo build --release              # Build firmware
@@ -16,15 +16,15 @@ cargo rb                           # Alias: run --bin uart_logger --release
 cargo run --bin blink_test --release  # LED test binary
 ```
 
-**Toolchain:** Rust nightly, target `thumbv8m.main-none-eabihf`
-**Flashing:** `probe-rs` (SWD) or UF2 copy to RP2350 USB drive
-**Logging:** defmt via RTT, level controlled by `DEFMT_LOG` env var (default: `debug` in `.cargo/config.toml`)
+**Тулчейн:** Rust nightly, target `thumbv8m.main-none-eabihf`
+**Прошивка:** `probe-rs` (SWD) или копирование UF2 на USB-диск RP2350
+**Логирование:** defmt через RTT, уровень управляется переменной окружения `DEFMT_LOG` (по умолчанию `debug` в `.cargo/config.toml`)
 
-## Architecture
+## Архитектура
 
-Async multi-task design on Embassy runtime, no OS. All inter-task communication via channels and atomics.
+Асинхронный многозадачный дизайн на рантайме Embassy, без ОС. Все межзадачные взаимодействия — через каналы и атомики.
 
-**Task flow:**
+**Поток задач:**
 ```
 UART0 RX (GPIO1) ──┐
                     ├──> Channel(32) ──> sd_writer_task ──> LOG_NNNN.BIN (FAT32)
@@ -33,20 +33,20 @@ UART1 RX (GPIO5) ──┘
                          Watchdog (5s) reboots on hang
 ```
 
-**Tasks (src/main.rs):**
-- `uart_rx_task` (pool_size=2) — blocks on UART RX, non-blocking send to channel. Drops packets on overflow.
-- `sd_writer_task` — receives from channel, batch-writes to SD via SPI1. Handles file rotation (100 MB), heartbeat flush (2s), sync (5s), error recovery.
-- `led_task` — reads `SYSTEM_STATE` atomic, drives WS2812B via PIO.
-- Main — init peripherals, spawn tasks, idle loop with watchdog feed.
+**Задачи (src/main.rs):**
+- `uart_rx_task` (pool_size=2) — блокируется на UART RX, неблокирующая отправка в канал. Дропает пакеты при переполнении.
+- `sd_writer_task` — принимает из канала, пишет на SD через SPI1 пачками. Делает ротацию файлов (100 МБ), heartbeat flush (2 с), sync (5 с), error recovery.
+- `led_task` — читает атомик `SYSTEM_STATE`, управляет WS2812B через PIO.
+- Main — инит периферии, спавн задач, idle-loop с feed watchdog.
 
-**Key modules:**
-- `src/config.rs` — all tuneable constants (baud rate, buffer sizes, timeouts, state codes)
-- `src/led.rs` — WS2812B PIO driver with color definitions
-- `src/sd_writer.rs` — binary record encoding, write buffer, time source, filename generation
+**Ключевые модули:**
+- `src/config.rs` — все тюнинг-константы (baud rate, размеры буферов, таймауты, коды состояний)
+- `src/led.rs` — драйвер WS2812B на PIO с определениями цветов
+- `src/sd_writer.rs` — кодирование бинарных записей, write-буфер, источник времени, генерация имён файлов
 
-**Buffering chain:** UART RX buf (16 KB per channel) → Channel (32 packets) → SD write buf (8 KB) → SD card
+**Цепочка буферизации:** UART RX buf (16 KB на канал) → Channel (32 packets) → SD write buf (8 KB) → SD card
 
-## Hardware Pinout
+## Распиновка железа
 
 | Function | GPIO | Notes |
 |----------|------|-------|
@@ -55,9 +55,9 @@ UART1 RX (GPIO5) ──┘
 | SPI1 SCK/MOSI/MISO/CS | GPIO10-13 | SD card |
 | WS2812B LED | GPIO25 | On-board RGB |
 
-## Binary Log Format
+## Формат бинарного лога
 
-Files: `LOG_0001.BIN` .. `LOG_9999.BIN` (auto-rotated at 100 MB)
+Файлы: `LOG_0001.BIN` .. `LOG_9999.BIN` (автоматическая ротация на 100 МБ)
 
 ```
 Offset  Size  Field
@@ -67,10 +67,27 @@ Offset  Size  Field
 7       N     Payload bytes
 ```
 
-## Conventions
+## Соглашения
 
-- Documentation and comments are in Russian
-- defmt is used for all logging (not println)
-- Shared state between tasks uses `portable-atomic` AtomicU8/AtomicU32
-- `build.rs` generates the memory layout (`memory.x`) — do not create `memory.x` manually
-- SD card must be FAT32 (exFAT not supported); cards ≥64 GB need reformatting
+- Документация и комментарии — на русском
+- Для логирования используется defmt (не println)
+- Разделяемое состояние между задачами — через `portable-atomic` AtomicU8/AtomicU32
+- `build.rs` генерирует memory layout (`memory.x`) — `memory.x` руками не создавать
+- SD-карта должна быть FAT32 (exFAT не поддерживается); карты ≥64 ГБ нужно переформатировать
+
+<!-- serena:start -->
+# Serena — Symbolic Code Tools
+
+This project is configured for Serena (`.serena/`). Serena's MCP tools give
+language-server-backed symbolic access to the code. Prefer them over reading
+whole files or grepping.
+
+## Use Serena for
+- **Surveying a file** — `get_symbols_overview` before reading a file in full.
+- **Finding a symbol** — `find_symbol` by name path instead of grep.
+- **Tracing usage** — `find_referencing_symbols` to see callers/dependents.
+- **Editing precisely** — `replace_symbol_body`, `insert_after_symbol`,
+  `insert_before_symbol` instead of manual line edits.
+
+Read full file bodies only when symbolic tools don't cover the need.
+<!-- serena:end -->
