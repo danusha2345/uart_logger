@@ -92,7 +92,7 @@ cargo build --release
 cargo run --release      # прошивка через probe-rs
 ```
 
-Требуется: Rust nightly, `probe-rs`, подключение через SWD.
+Требуется: Rust stable, `probe-rs`, подключение через SWD.
 
 ## Подготовка SD-карты
 

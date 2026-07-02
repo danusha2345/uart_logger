@@ -4,7 +4,7 @@
 
 ## Обзор проекта
 
-Пассивный двунаправленный логгер UART-трафика на **Spotpear RP2350-Core-A** (ARM Cortex-M85). Захватывает две UART-линии на 921600 baud и пишет на SD-карту в бинарном формате. Устройство только слушает (RX), никогда не передаёт. Написано на embedded Rust (no_std) с асинхронным рантаймом Embassy.
+Пассивный двунаправленный логгер UART-трафика на **Spotpear RP2350-Core-A** (ARM Cortex-M33). Захватывает две UART-линии на 921600 baud и пишет на SD-карту в бинарном формате. Устройство только слушает (RX), никогда не передаёт. Написано на embedded Rust (no_std) с асинхронным рантаймом Embassy.
 
 ## Команды сборки и прошивки
 
@@ -16,7 +16,7 @@ cargo rb                           # Alias: run --bin uart_logger --release
 cargo run --bin blink_test --release  # LED test binary
 ```
 
-**Тулчейн:** Rust nightly, target `thumbv8m.main-none-eabihf`
+**Тулчейн:** Rust stable, target `thumbv8m.main-none-eabihf`
 **Прошивка:** `probe-rs` (SWD) или копирование UF2 на USB-диск RP2350
 **Логирование:** defmt через RTT, уровень управляется переменной окружения `DEFMT_LOG` (по умолчанию `debug` в `.cargo/config.toml`)
 
@@ -37,7 +37,7 @@ UART1 RX (GPIO5) ──┘
 - `uart_rx_task` (pool_size=2) — блокируется на UART RX, неблокирующая отправка в канал. Дропает пакеты при переполнении.
 - `sd_writer_task` — принимает из канала, пишет на SD через SPI1 пачками. Делает ротацию файлов (100 МБ), heartbeat flush (2 с), sync (5 с), error recovery.
 - `led_task` — читает атомик `SYSTEM_STATE`, управляет WS2812B через PIO.
-- Main — инит периферии, спавн задач, idle-loop с feed watchdog.
+- Main — инит периферии, спавн задач, idle-loop. Watchdog кормит `sd_writer_task`.
 
 **Ключевые модули:**
 - `src/config.rs` — все тюнинг-константы (baud rate, размеры буферов, таймауты, коды состояний)
